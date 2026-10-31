@@ -61,6 +61,9 @@ function getPosition(): Promise<{ lat: number; lng: number } | null> {
       p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
       () => resolve(null),
       { timeout: 8000 }
+    );
+  });
+}
 
 export default function HospitalGuide() {
   const [msgs, setMsgs] = useState<Msg[]>([
@@ -143,8 +146,3 @@ export default function HospitalGuide() {
       )}
     </div>
   );
-}
-
-    );
-  });
-}
