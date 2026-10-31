@@ -1,3 +1,5 @@
+// Registry of hospitals with VERIFIED floor plans. Any other Italian hospital is
+// still handled via Google Places + grounded search (see services/guide.ts).
 // Curated hospital directory. Fill/refresh this from the hospital's OFFICIAL site.
 // Never let the model invent locations: it only picks an id from this list.
 
@@ -15,6 +17,7 @@ export interface Clinic {
 
 export interface Hospital {
   id: string;
+  placeId?: string;       // Google Place ID (optional; else matched by location)
   name: string;
   address: string;
   location: { lat: number; lng: number }; // main entrance
@@ -23,7 +26,7 @@ export interface Hospital {
   clinics: Clinic[];
 }
 
-export const HOSPITALS: Hospital[] = [
+export const REGISTRY: Hospital[] = [
   {
     id: "umberto-i",
     name: "Policlinico Umberto I",

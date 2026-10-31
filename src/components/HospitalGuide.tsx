@@ -1,77 +1,21 @@
 import React, { useState } from "react";
-import { GoogleGenAI, Type } from "@google/genai";
-import { HOSPITALS, Hospital, Clinic } from "../data/hospitals";
-
-// In AI Studio the key is injected as process.env.GEMINI_API_KEY.
-// For production, call Gemini from a backend instead of the browser.
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+import { Hospital, Clinic } from "../data/hospitals";
+import {
+  understand, findHospital, lookupRegistry, pickClinic, searchOfficialInfo,
+  mapsUrl, getPosition, Place,
+} from "../services/guide";
 
 interface Msg { role: "user" | "bot"; text: string }
-interface Match { hospital: Hospital; clinic: Clinic }
-interface Intent { hospitalId: string | null; clinicId: string | null; startAddress: string | null }
-
-const catalog = HOSPITALS.map(h => ({
-  hospitalId: h.id, hospital: h.name,
-  clinics: h.clinics.map(c => ({ clinicId: c.id, name: c.name, aliases: c.aliases })),
-}));
-
-// Gemini ONLY classifies the request into ids from our catalog (structured JSON).
-async function understand(text: string): Promise<Intent> {
-  const res = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: text,
-    config: {
-      systemInstruction:
-        "You help patients find clinics. Map the user's message to a hospitalId and clinicId " +
-        "from this catalog only; use null if unsure. If the user states where they are starting " +
-        "from (address, city, station), put it in startAddress, else null. Catalog: " +
-        JSON.stringify(catalog),
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          hospitalId: { type: Type.STRING, nullable: true },
-          clinicId: { type: Type.STRING, nullable: true },
-          startAddress: { type: Type.STRING, nullable: true },
-        },
-        required: ["hospitalId", "clinicId", "startAddress"],
-      },
-    },
-  });
-  return JSON.parse(res.text ?? "{}");
-}
-
-type Origin = string | { lat: number; lng: number } | null;
-
-function mapsUrl(h: Hospital, origin: Origin) {
-  const p = new URLSearchParams({
-    api: "1",
-    destination: `${h.location.lat},${h.location.lng}`,
-    travelmode: "transit",
-  });
-  if (origin) p.set("origin", typeof origin === "string" ? origin : `${origin.lat},${origin.lng}`);
-  // Without origin, Google Maps uses the device's current location.
-  return `https://www.google.com/maps/dir/?${p}`;
-}
-
-function getPosition(): Promise<{ lat: number; lng: number } | null> {
-  return new Promise(resolve => {
-    if (!navigator.geolocation) return resolve(null);
-    navigator.geolocation.getCurrentPosition(
-      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
-      () => resolve(null),
-      { timeout: 8000 }
-    );
-  });
-}
+interface Source { title: string; uri: string }
+interface Result { place: Place; registry: Hospital | null; clinic: Clinic | null; sources: Source[] }
 
 export default function HospitalGuide() {
   const [msgs, setMsgs] = useState<Msg[]>([
-    { role: "bot", text: "Hi! Tell me the hospital and clinic (e.g. \"Gynaecology at Umberto I\"). You can also say where you are starting from." },
+    { role: "bot", text: "Ciao! Dimmi quale ospedale e quale reparto cerchi (es. \"Ginecologia al Policlinico Umberto I di Roma\"). Puoi dirmi anche da dove parti." },
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [match, setMatch] = useState<Match | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
   const [startAddress, setStartAddress] = useState<string | null>(null);
   const [routeUrl, setRouteUrl] = useState<string | null>(null);
 
@@ -83,65 +27,98 @@ export default function HospitalGuide() {
     setInput(""); say("user", text); setBusy(true);
     try {
       const intent = await understand(text);
-      const hospital = HOSPITALS.find(h => h.id === intent.hospitalId);
-      const clinic = hospital?.clinics.find(c => c.id === intent.clinicId);
+      const start = intent.startAddress ?? startAddress;
       if (intent.startAddress) setStartAddress(intent.startAddress);
 
-      if (hospital && clinic) {
-        setMatch({ hospital, clinic });
-        const start = intent.startAddress ?? startAddress;
-        setRouteUrl(start ? mapsUrl(hospital, start) : null);
-        say("bot", `${clinic.name} — ${hospital.name}: ${clinic.building}, ${clinic.floor}. ${clinic.directions}` +
-          (start ? " Your route from the address you gave is ready below." : " Use \"Route from my position\" for directions."));
-      } else if (match && intent.startAddress) {
-        setRouteUrl(mapsUrl(match.hospital, intent.startAddress));
-        say("bot", `Route from ${intent.startAddress} is ready below.`);
-      } else {
-        say("bot", "I couldn't find that clinic in my directory. Please name the hospital and the clinic/department.");
+      // Follow-up like "I'm at Termini": reuse the current hospital.
+      if (!intent.hospitalQuery && result && intent.startAddress) {
+        setRouteUrl(mapsUrl(result.place, intent.startAddress));
+        say("bot", `Percorso da ${intent.startAddress} pronto qui sotto.`);
+        return;
       }
+      if (!intent.hospitalQuery) {
+        say("bot", "Non ho capito quale ospedale cerchi. Indica nome e città.");
+        return;
+      }
+      const place = await findHospital(intent.hospitalQuery);
+      if (!place) { say("bot", "Non ho trovato questo ospedale. Prova con nome e città."); return; }
+
+      const registry = lookupRegistry(place);
+      let clinic: Clinic | null = null;
+      let sources: Source[] = [];
+      let reply: string;
+
+      if (registry && intent.department) clinic = await pickClinic(registry, intent.department);
+
+      if (registry && clinic) {
+        reply = `${clinic.name} — ${registry.name}: ${clinic.building}, ${clinic.floor}. ${clinic.directions}`;
+      } else {
+        // Not in registry (or clinic unknown): grounded search of official sources.
+        const info = await searchOfficialInfo(place, intent.department);
+        sources = info.sources;
+        reply = `${place.name} (${place.address}).\n${info.text}\n` +
+          "Nota: non ho una planimetria verificata per questo reparto; controlla le fonti ufficiali.";
+      }
+      setResult({ place, registry, clinic, sources });
+      setRouteUrl(start ? mapsUrl(place, start) : null);
+      say("bot", reply + (start ? "\nPercorso pronto qui sotto." : "\nUsa \"Percorso dalla mia posizione\"."));
     } catch {
-      say("bot", "Sorry, something went wrong. Please try again.");
+      say("bot", "Si è verificato un errore. Riprova.");
     } finally { setBusy(false); }
   }
 
   async function routeFromMyPosition() {
-    if (!match) return;
-    const pos = await getPosition();
-    setRouteUrl(mapsUrl(match.hospital, pos)); // null => Google Maps uses device location
+    if (!result) return;
+    setRouteUrl(mapsUrl(result.place, await getPosition())); // null => Maps uses device location
   }
+
+  const bubble = (role: Msg["role"]) => ({
+    background: role === "user" ? "#d6e8ff" : "#eee", padding: "6px 10px", borderRadius: 12, display: "inline-block",
+  });
+  const marker = (c: Clinic) => ({
+    position: "absolute" as const, left: `${c.marker.x}%`, top: `${c.marker.y}%`,
+    width: 22, height: 22, marginLeft: -11, marginTop: -11, borderRadius: "50%",
+    background: "red", border: "3px solid white", boxShadow: "0 0 0 3px rgba(255,0,0,.4)",
+  });
 
   return (
     <div style={{ maxWidth: 720, margin: "0 auto", fontFamily: "sans-serif" }}>
-      <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12, height: 260, overflowY: "auto" }}>
+      <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12, height: 280, overflowY: "auto" }}>
         {msgs.map((m, i) => (
-          <p key={i} style={{ textAlign: m.role === "user" ? "right" : "left" }}>
-            <span style={{ background: m.role === "user" ? "#d6e8ff" : "#eee", padding: "6px 10px", borderRadius: 12, display: "inline-block" }}>{m.text}</span>
+          <p key={i} style={{ textAlign: m.role === "user" ? "right" : "left", whiteSpace: "pre-wrap" }}>
+            <span style={bubble(m.role)}>{m.text}</span>
           </p>
         ))}
         {busy && <p>…</p>}
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
         <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && send()}
-          placeholder="e.g. Gynaecology clinic at Umberto I, I'm at Termini station" style={{ flex: 1, padding: 8 }} />
-        <button onClick={send} disabled={busy}>Send</button>
+          placeholder="Es. Cardiologia al Cardarelli di Napoli, parto da Piazza Garibaldi" style={{ flex: 1, padding: 8 }} />
+        <button onClick={send} disabled={busy}>Invia</button>
       </div>
 
-      {match && (
+      {result && (
         <section style={{ marginTop: 16 }}>
-          <h3>{match.clinic.name} — {match.hospital.name}</h3>
-          <div style={{ position: "relative", display: "inline-block", width: "100%" }}>
-            <img src={match.clinic.mapImageUrl} alt={`Map of ${match.clinic.name}`} style={{ width: "100%", display: "block" }} />
-            <div title={match.clinic.name} style={{
-              position: "absolute", left: `${match.clinic.marker.x}%`, top: `${match.clinic.marker.y}%`,
-              width: 22, height: 22, marginLeft: -11, marginTop: -11, borderRadius: "50%",
-              background: "red", border: "3px solid white", boxShadow: "0 0 0 3px rgba(255,0,0,.4)",
-            }} />
-          </div>
-          <p style={{ fontSize: 12, color: "#666" }}>
-            Map source: <a href={match.hospital.officialSourceUrl} target="_blank" rel="noreferrer">official hospital website</a> (last checked {match.hospital.mapsLastChecked}). Always follow on-site signs.
-          </p>
-          <button onClick={routeFromMyPosition}>Route from my position</button>{" "}
-          {routeUrl && <a href={routeUrl} target="_blank" rel="noreferrer">Open route in Google Maps ↗</a>}
+          <h3>{result.clinic ? result.clinic.name + " — " : ""}{result.place.name}</h3>
+          {result.registry && result.clinic && (
+            <>
+              <div style={{ position: "relative", width: "100%" }}>
+                <img src={result.clinic.mapImageUrl} alt={`Mappa ${result.clinic.name}`} style={{ width: "100%", display: "block" }} />
+                <div title={result.clinic.name} style={marker(result.clinic)} />
+              </div>
+              <p style={{ fontSize: 12, color: "#666" }}>
+                Fonte: <a href={result.registry.officialSourceUrl} target="_blank" rel="noreferrer">sito ufficiale</a> (verificata il {result.registry.mapsLastChecked}). Segui sempre la segnaletica.
+              </p>
+            </>
+          )}
+          {result.sources.length > 0 && (
+            <ul style={{ fontSize: 13 }}>
+              {result.sources.map(s => <li key={s.uri}><a href={s.uri} target="_blank" rel="noreferrer">{s.title}</a></li>)}
+            </ul>
+          )}
+          {result.place.website && <p><a href={result.place.website} target="_blank" rel="noreferrer">Sito dell'ospedale ↗</a></p>}
+          <button onClick={routeFromMyPosition}>Percorso dalla mia posizione</button>{" "}
+          {routeUrl && <a href={routeUrl} target="_blank" rel="noreferrer">Apri il percorso in Google Maps ↗</a>}
         </section>
       )}
     </div>
